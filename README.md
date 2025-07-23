@@ -27,11 +27,11 @@ python query_local.py "Your question in quotes"
 
 💡 Example Queries
 Generated bash
-# General question
+### General question
 python query_local.py "Summarize the main points of the lease agreement"
 
-# Analytical question
+### Analytical question
 python query_local.py "What is the sentiment of the <sender_name> whatsapp chat?"
 
-# Complex, specific question
+### Complex, specific question
 python query_local.py "Find the latest email from <sender_name> and summarize it"
