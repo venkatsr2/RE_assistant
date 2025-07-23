@@ -1,0 +1,11 @@
+openai
+python-dotenv
+unstructured[local-inference]
+pandas
+openpyxl
+tqdm
+sentence-transformers
+faiss-cpu
+numpy
+tiktoken
+google-generativeai

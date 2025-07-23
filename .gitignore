@@ -1,0 +1,15 @@
+# .gitignore
+.env
+data/
+credentials.json
+token.json
+metadata_store.pkl
+faiss_index.bin
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+*.venv
+env/
+.env
