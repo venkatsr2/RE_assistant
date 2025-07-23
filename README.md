@@ -31,7 +31,7 @@ Generated bash
 python query_local.py "Summarize the main points of the lease agreement"
 
 # Analytical question
-python query_local.py "What is the sentiment of the 2G Tula whatsapp chat?"
+python query_local.py "What is the sentiment of the <sender_name> whatsapp chat?"
 
 # Complex, specific question
-python query_local.py "Find the latest email from customer.communications@2getherments.com and summarize it"
+python query_local.py "Find the latest email from <sender_name> and summarize it"
