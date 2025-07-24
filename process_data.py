@@ -90,9 +90,16 @@ def get_chunks_and_metadata(client, file_path):
         raw_chunks = []
         file_level_metadata = base_metadata.copy()
 
-        if file_ext == '.txt' and filename.startswith('WhatsApp Chat with'):
+        if file_ext == '.txt' and filename.lower().startswith('whatsapp chat with'):
             items_to_return = []
-            chat_pattern = re.compile(r"^(\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2})\s-\s([^:]+):\s(.*)")
+            # This new regex is more flexible:
+            # - Handles 1 or 2 digit day/month, 2 or 4 digit year
+            # - Handles 12-hour or 24-hour time
+            # - Makes AM/PM optional
+            chat_pattern = re.compile(
+                r"^(\d{1,2}/\d{1,2}/\d{2,4},\s\d{1,2}:\d{2}(?:\s[ap]m)?)\s-\s([^:]+):\s(.*)",
+                re.IGNORECASE
+            )
             current_message_text, current_msg_meta = "", {}
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -109,7 +116,14 @@ def get_chunks_and_metadata(client, file_path):
                         current_message_text += "\n" + line.strip()
             if current_message_text:
                 items_to_return.append((current_message_text, current_msg_meta))
-            return items_to_return
+            # Apply final quality filtering to the extracted messages
+            final_items = []
+            for text, metadata in items_to_return:
+                clean_chunks = filter_and_split_chunks([text])
+                for clean_chunk in clean_chunks:
+                    final_items.append((clean_chunk, metadata))
+            return final_items
+        
 
         elif file_ext == '.pdf':
             try:
@@ -131,7 +145,9 @@ def get_chunks_and_metadata(client, file_path):
         else:
             return []
         
-        return [(chunk, file_level_metadata) for chunk in raw_chunks]
+        # Apply quality filtering to all other document types
+        final_chunks = filter_and_split_chunks(raw_chunks)
+        return [(chunk, file_level_metadata) for chunk in final_chunks]
 
     except Exception as e:
         logging.error(f"Could not process file {file_path}: {e}")

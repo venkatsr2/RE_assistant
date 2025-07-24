@@ -62,8 +62,14 @@ def inspect_database():
     for i, metadata in enumerate(metadata_store):
         if all(v is not None for v in types_to_find.values()): break
         source = metadata.get('source', '').lower()
-        if types_to_find["WhatsApp Chat"] is None and source.startswith('whatsapp chat with'):
+        # --- THE DEFINITIVE FIX ---
+        # We now check if the phrase is 'in' the source path, which is much more robust.
+        # We also check the basename to be more precise.
+        filename = os.path.basename(source)
+
+        if types_to_find["WhatsApp Chat"] is None and filename.startswith('whatsapp chat with'):
             types_to_find["WhatsApp Chat"] = i
+            continue
         elif types_to_find["Email in PDF"] is None and source.endswith('.pdf') and metadata.get('is_email'):
             types_to_find["Email in PDF"] = i
         elif types_to_find["Generic PDF"] is None and source.endswith('.pdf') and not metadata.get('is_email'):

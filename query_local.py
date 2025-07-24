@@ -5,7 +5,9 @@ import argparse
 import pickle
 import numpy as np
 import faiss
-
+import re
+import json
+from datetime import datetime, timedelta
 from openai import OpenAI
 import tiktoken
 
@@ -15,7 +17,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FAISS_INDEX_PATH = os.path.join(SCRIPT_DIR, "faiss_index.bin")
 METADATA_PATH = os.path.join(SCRIPT_DIR, "metadata_store.pkl")
 CONTEXT_TOKEN_LIMIT = 100000
-EMBEDDING_MODEL = "text-embedding-3-small"
 
 # --- INITIALIZATION ---
 def initialize_services():
@@ -36,6 +37,86 @@ def initialize_services():
     print("[+] Services and data loaded.")
     return client, faiss_index, metadata_store
 
+# --- QUERY DECOMPOSER (Unchanged, it is correct) ---
+def decompose_query_with_llm(client, user_query, metadata_keys):
+    """Uses an LLM to decompose a query into a structured search plan."""
+    system_prompt = f"""
+    You are an expert query analyzer. Decompose a user's query into a structured JSON object.
+    
+    Available metadata fields for filtering are: {', '.join(f"'{key}'" for key in metadata_keys)}.
+    
+    Decompose into:
+    1.  `semantic_query`: The core topic to search for.
+    2.  `metadata_filter`: A dictionary of key-value pairs to filter on.
+
+    RULES:
+    - Your response MUST be ONLY the single JSON object.
+    - If no filters are mentioned, `metadata_filter` must be an empty dictionary {{}}.
+    - For emails, the sender is `from`. For WhatsApp, the sender is `sender`.
+    - For document names, use the `source` field.
+
+    EXAMPLE:
+    User Query: "What is the sentiment of venkata satya in the Houston carpool whatsapp chat last month?"
+    Your JSON:
+    {{
+      "semantic_query": "sentiment analysis",
+      "metadata_filter": {{
+        "sender": "venkat",
+        "source": "Hoston carpool whatsapp chat"
+      }}
+    }}
+    """
+    try:
+        # Using a powerful model for better decomposition
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}],
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"\n[!] Could not decompose query. Falling back to simple search. Error: {e}")
+        return {"semantic_query": user_query, "metadata_filter": {}}
+
+# --- FUZZY METADATA FILTERING (THE DEFINITIVE FIX) ---
+def apply_fuzzy_filter_and_score(metadata_store, filter_dict):
+    """
+    Scores every document based on how well its metadata matches the filter plan.
+    This handles partial matches for names and sources.
+    """
+    if not filter_dict:
+        # If no filter, all documents are candidates with a neutral score
+        return list(range(len(metadata_store)))
+
+    candidate_scores = []
+    # Normalize filter values once
+    filter_values = {key: str(value).lower().split() for key, value in filter_dict.items()}
+
+    for i, metadata in enumerate(metadata_store):
+        score = 0
+        match_count = 0
+        
+        for key, query_parts in filter_values.items():
+            metadata_value = metadata.get(key)
+            if metadata_value is not None:
+                metadata_value_lower = str(metadata_value).lower()
+                # Check if all parts of the query value are in the metadata value
+                if all(part in metadata_value_lower for part in query_parts):
+                    score += 1 # Add 1 point for each matching key
+                    match_count += 1
+
+        # Only consider documents that matched at least one filter condition
+        if match_count > 0:
+            # We can add more sophisticated scoring here later if needed
+            candidate_scores.append({'index': i, 'score': score})
+
+    # Sort candidates by their score (higher is better)
+    candidate_scores.sort(key=lambda x: x['score'], reverse=True)
+    
+    # Return the indices of the sorted candidates
+    return [item['index'] for item in candidate_scores]
+
 # --- ANSWER GENERATION ---
 def get_answer_from_gpt(client, query, context):
     """Uses gpt-4o to analyze context and provide an answer."""
@@ -47,7 +128,8 @@ def get_answer_from_gpt(client, query, context):
     2.  Thoroughly analyze all the provided context chunks. Internally filter this context to find only the chunks that match the user's specific conditions.
     3.  Synthesize a single, concise, and accurate answer using ONLY the information found in the filtered context.
     4.  Cite the source file for every piece of information using the format [source: file_name].
-    5.  If, after careful analysis, you cannot find the answer, you MUST state: "Based on the retrieved documents, I could not find a specific answer to your question."
+    5.  For sentiment analysis, focus on the overall tone and key phrases, while identifying and ignoring noise.
+    6.  If, after careful analysis, you cannot find the answer, you MUST state: "Based on the retrieved documents, I could not find a specific answer to your question."
     """
     user_prompt = f"Retrieved Context:\n---\n{context}\n---\n\nUser's Original Question:\n{query}\n\nFinal Answer:"
     
@@ -64,31 +146,58 @@ def get_answer_from_gpt(client, query, context):
 def main():
     parser = argparse.ArgumentParser(description="Ask a natural language question to your local real estate data.")
     parser.add_argument("query", type=str, help="Your full question, enclosed in quotes.")
-    parser.add_argument("--top_k", type=int, default=100, help="Number of initial candidate documents to retrieve for the LLM to analyze.")
+    parser.add_argument("--top_k", type=int, default=100, help="Number of documents to retrieve/re-rank.")
+    parser.add_argument("--candidates", type=int, default=500, help="Number of initial candidates to consider from metadata filter.")
     args = parser.parse_args()
     
     client, faiss_index, metadata_store = initialize_services()
     if not client: return
 
     try:
-        print(f"\n[1] Performing a broad semantic search for: \"{args.query}\"")
+        available_keys = list(metadata_store[0].keys()) if metadata_store else []
         
-        response = client.embeddings.create(input=[args.query], model=EMBEDDING_MODEL)
-        query_embedding = np.array([response.data[0].embedding]).astype('float32')
+        print(f"\n[1] Decomposing your query with LLM: \"{args.query}\"")
+        search_plan = decompose_query_with_llm(client, args.query, available_keys)
         
-        distances, indices = faiss_index.search(query_embedding, args.top_k)
-        retrieved_indices = indices[0]
+        semantic_query = search_plan.get("semantic_query", args.query)
+        metadata_filter = search_plan.get("metadata_filter", {})
+
+        print(f"    - Semantic Search For: \"{semantic_query}\"")
+        if metadata_filter: print(f"    - Applying Fuzzy Filter: {json.dumps(metadata_filter)}")
+        else: print("    - No specific filters identified.")
         
-        if len(retrieved_indices) == 0 or retrieved_indices[0] == -1:
-            print("\n[!] No relevant documents found in the initial search.")
+        # STAGE 1: FUZZY METADATA-FIRST FILTERING
+        candidate_indices = apply_fuzzy_filter_and_score(metadata_store, metadata_filter)
+        # Limit the number of candidates to avoid huge in-memory indexes
+        candidate_indices = candidate_indices[:args.candidates]
+        print(f"    - Found {len(candidate_indices)} candidate chunks after fuzzy filtering.")
+
+        if not candidate_indices:
+            print("\n[!] No documents found matching your filter criteria.")
             return
 
-        retrieved_metadatas = [metadata_store[i] for i in retrieved_indices]
+        # STAGE 2: SEMANTIC RE-RANKING
+        print(f"[2] Performing semantic re-ranking on candidates...")
+        candidate_vectors = np.array([faiss_index.reconstruct(i) for i in candidate_indices]).astype('float32')
+        if candidate_vectors.size == 0:
+            print("\n[!] No vectors found for candidate chunks.")
+            return
+            
+        temp_index = faiss.IndexFlatL2(candidate_vectors.shape[1])
+        temp_index.add(candidate_vectors)
+        
+        response = client.embeddings.create(input=[semantic_query], model="text-embedding-3-small")
+        query_embedding = np.array([response.data[0].embedding]).astype('float32')
+        
+        distances, temp_indices = temp_index.search(query_embedding, k=min(args.top_k, len(candidate_indices)))
+        
+        original_indices = [candidate_indices[i] for i in temp_indices[0] if i != -1]
+        final_results = [metadata_store[i] for i in original_indices]
         
         print("\n" + "="*80)
         print("                  INITIAL RETRIEVED CONTEXT (Top 5 for Verification)")
         print("="*80)
-        for i, doc in enumerate(retrieved_metadatas[:5]):
+        for i, doc in enumerate(final_results[:5]):
             print(f"\n--- Result {i+1} ---")
             print(f"  - Source:  {doc.get('source', 'N/A')}")
             if 'sender' in doc: print(f"  - Sender:  {doc.get('sender')}")
@@ -105,15 +214,15 @@ def main():
         base_prompt_tokens = len(tokenizer.encode(f"User's Question: {args.query}")) + 300
         token_budget = CONTEXT_TOKEN_LIMIT - base_prompt_tokens
 
-        for doc in retrieved_metadatas:
+        for doc in final_results:
             chunk_text = f"Source: {doc.get('source', 'N/A')}\nContent: {doc.get('original_text', '')}\n---\n"
             chunk_tokens = len(tokenizer.encode(chunk_text))
             if total_tokens + chunk_tokens > token_budget: break
             context_for_llm += chunk_text
             total_tokens += chunk_tokens
             included_chunks += 1
-        
-        print(f"\n[2] Passing {included_chunks} of {len(retrieved_metadatas)} chunks ({total_tokens} tokens) to gpt-4o for final analysis...")
+        # print(f"\n[3] Context for llm: {context_for_llm}") #for debugging
+        print(f"\n[2] Passing {included_chunks} of {len(final_results)} chunks ({total_tokens} tokens) to gpt-4o for final analysis...")
         final_answer = get_answer_from_gpt(client, args.query, context_for_llm)
         
         print("\n" + "="*80 + "\n                        FINAL ANSWER\n" + "="*80 + "\n")
