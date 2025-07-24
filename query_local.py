@@ -5,28 +5,25 @@ import argparse
 import pickle
 import numpy as np
 import faiss
-import re
 
-import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
+import tiktoken
 
 # --- CONFIGURATION ---
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FAISS_INDEX_PATH = os.path.join(SCRIPT_DIR, "faiss_index.bin")
 METADATA_PATH = os.path.join(SCRIPT_DIR, "metadata_store.pkl")
+CONTEXT_TOKEN_LIMIT = 100000
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 # --- INITIALIZATION ---
 def initialize_services():
-    """Load all necessary clients, models, and local data files."""
+    """Load OpenAI client, FAISS index, and metadata."""
     print("[*] Loading services and data...")
     load_dotenv()
-    
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    if not google_api_key: raise ValueError("FATAL: GOOGLE_API_KEY not found in .env file.")
-    genai.configure(api_key=google_api_key)
-    
-    embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    if not client.api_key: raise ValueError("FATAL: OPENAI_API_KEY not found.")
     
     try:
         faiss_index = faiss.read_index(FAISS_INDEX_PATH)
@@ -34,37 +31,34 @@ def initialize_services():
             metadata_store = pickle.load(f)
     except FileNotFoundError:
         print(f"\n[!] FATAL: Index files not found. Please run 'process_data.py' first.")
-        return None, None, None, None
+        return None, None, None
 
     print("[+] Services and data loaded.")
-    return genai, embedding_model, faiss_index, metadata_store
+    return client, faiss_index, metadata_store
 
-# --- ANSWER GENERATION (THE FIX) ---
-def get_answer_from_gemini(genai_client, query, context):
-    """Uses the Gemini 1.5 Pro model to analyze a broad context and provide a specific answer."""
-    # The prompt structure for Gemini is a simple list of strings.
-    prompt_parts = [
-        "You are a highly intelligent AI assistant for a real estate business. Your task is to answer the user's question based *only* on the provided context from internal documents.",
-        "RULES:",
-        "1. Carefully read the user's entire question to understand their specific intent.",
-        "2. Thoroughly analyze all the provided context chunks.",
-        "3. Synthesize a single, concise, and accurate answer using ONLY the information found in the context.",
-        "4. Cite the source file for every piece of information using the format [source: file_name].",
-        "5. If you cannot find the answer within the context, you MUST state: 'Based on the retrieved documents, I could not find a specific answer.'",
-        "\n--- CONTEXT START ---\n",
-        context,
-        "\n--- CONTEXT END ---\n",
-        "User's Question: " + query,
-        "Final Answer: "
-    ]
+# --- ANSWER GENERATION ---
+def get_answer_from_gpt(client, query, context):
+    """Uses gpt-4o to analyze context and provide an answer."""
+    system_prompt = """
+    You are a highly intelligent AI assistant for a real estate business. You will be given a user's question and a broad set of retrieved text chunks that may or may not contain the answer.
+
+    Your task is to act as an expert analyst:
+    1.  Carefully read the user's entire question to understand their specific intent, including any names, dates, conditions, or document types (like "email" or "whatsapp chat").
+    2.  Thoroughly analyze all the provided context chunks. Internally filter this context to find only the chunks that match the user's specific conditions.
+    3.  Synthesize a single, concise, and accurate answer using ONLY the information found in the filtered context.
+    4.  Cite the source file for every piece of information using the format [source: file_name].
+    5.  If, after careful analysis, you cannot find the answer, you MUST state: "Based on the retrieved documents, I could not find a specific answer to your question."
+    """
+    user_prompt = f"Retrieved Context:\n---\n{context}\n---\n\nUser's Original Question:\n{query}\n\nFinal Answer:"
     
     try:
-        model = genai_client.GenerativeModel(model_name="gemini-1.5-pro-latest")
-        # The FIX is to use the correct variable name here
-        response = model.generate_content(prompt_parts)
-        return response.text
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            temperature=0.0)
+        return response.choices[0].message.content
     except Exception as e:
-        return f"(Could not generate answer from Gemini. Error: {e})"
+        return f"(Could not generate answer from gpt-4o. Error: {e})"
 
 # --- MAIN EXECUTION ---
 def main():
@@ -73,12 +67,14 @@ def main():
     parser.add_argument("--top_k", type=int, default=100, help="Number of initial candidate documents to retrieve for the LLM to analyze.")
     args = parser.parse_args()
     
-    genai_client, embedding_model, faiss_index, metadata_store = initialize_services()
-    if not genai_client: return
+    client, faiss_index, metadata_store = initialize_services()
+    if not client: return
 
     try:
         print(f"\n[1] Performing a broad semantic search for: \"{args.query}\"")
-        query_embedding = embedding_model.encode([args.query])
+        
+        response = client.embeddings.create(input=[args.query], model=EMBEDDING_MODEL)
+        query_embedding = np.array([response.data[0].embedding]).astype('float32')
         
         distances, indices = faiss_index.search(query_embedding, args.top_k)
         retrieved_indices = indices[0]
@@ -87,23 +83,38 @@ def main():
             print("\n[!] No relevant documents found in the initial search.")
             return
 
-        initial_results = [metadata_store[i] for i in retrieved_indices]
+        retrieved_metadatas = [metadata_store[i] for i in retrieved_indices]
         
         print("\n" + "="*80)
         print("                  INITIAL RETRIEVED CONTEXT (Top 5 for Verification)")
         print("="*80)
-        for i, doc in enumerate(initial_results[:5]):
+        for i, doc in enumerate(retrieved_metadatas[:5]):
             print(f"\n--- Result {i+1} ---")
-            source = doc.get('source', 'N/A')
-            text_snippet = doc.get('original_text', '').strip().replace('\n', ' ')[:350]
-            print(f"  - Source:  {source}")
+            print(f"  - Source:  {doc.get('source', 'N/A')}")
+            if 'sender' in doc: print(f"  - Sender:  {doc.get('sender')}")
+            if 'from' in doc: print(f"  - From:    {doc.get('from')}")
+            if 'subject' in doc: print(f"  - Subject: {doc.get('subject')}")
+            text_snippet = doc.get('original_text', '').strip().replace('\n', ' ')[:250]
             print(f"  - Text:    \"{text_snippet}...\"")
         print("="*80)
 
-        context_for_llm = "\n---\n".join([f"Source: {doc.get('source', 'N/A')}\nContent: {doc.get('original_text', '')}" for doc in initial_results])
+        # Build and truncate context
+        tokenizer = tiktoken.get_encoding("cl100k_base")
+        context_for_llm, total_tokens, included_chunks = "", 0, 0
         
-        print(f"\n[2] Passing {len(initial_results)} candidate chunks to Gemini 1.5 Pro for final filtering and analysis...")
-        final_answer = get_answer_from_gemini(genai_client, args.query, context_for_llm)
+        base_prompt_tokens = len(tokenizer.encode(f"User's Question: {args.query}")) + 300
+        token_budget = CONTEXT_TOKEN_LIMIT - base_prompt_tokens
+
+        for doc in retrieved_metadatas:
+            chunk_text = f"Source: {doc.get('source', 'N/A')}\nContent: {doc.get('original_text', '')}\n---\n"
+            chunk_tokens = len(tokenizer.encode(chunk_text))
+            if total_tokens + chunk_tokens > token_budget: break
+            context_for_llm += chunk_text
+            total_tokens += chunk_tokens
+            included_chunks += 1
+        
+        print(f"\n[2] Passing {included_chunks} of {len(retrieved_metadatas)} chunks ({total_tokens} tokens) to gpt-4o for final analysis...")
+        final_answer = get_answer_from_gpt(client, args.query, context_for_llm)
         
         print("\n" + "="*80 + "\n                        FINAL ANSWER\n" + "="*80 + "\n")
         print(f"Answer:\n{final_answer}\n")
@@ -112,7 +123,6 @@ def main():
         print(f"\n[!] An unexpected critical error occurred: {e}")
         import traceback
         traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
