@@ -40,10 +40,14 @@ def initialize_services():
 # --- QUERY DECOMPOSER (Unchanged, it is correct) ---
 def decompose_query_with_llm(client, user_query, metadata_keys):
     """Uses an LLM to decompose a query into a structured search plan."""
+    today_str = datetime.now().strftime('%Y-%m-%d')
     system_prompt = f"""
     You are an expert query analyzer. Decompose a user's query into a structured JSON object.
-    
-    Available metadata fields for filtering are: {', '.join(f"'{key}'" for key in metadata_keys)}.
+    Today's date is {today_str}.
+
+    ## AVAILABLE METADATA FIELDS FOR FILTERING:
+    These are the only fields you can use: {', '.join(f"'{key}'" for key in metadata_keys)}.
+    The `timestamp` and `date` fields are strings; you must create filters for them.
     
     Decompose into:
     1.  `semantic_query`: The core topic to search for.
@@ -54,15 +58,41 @@ def decompose_query_with_llm(client, user_query, metadata_keys):
     - If no filters are mentioned, `metadata_filter` must be an empty dictionary {{}}.
     - For emails, the sender is `from`. For WhatsApp, the sender is `sender`.
     - For document names, use the `source` field.
+    - If the query contains a date or a relative time period (e.g., "last month", "this week", "in July 2024"), create a date filter using the `timestamp` or `date` field.
+    - A date filter should be a dictionary with `"$gte"` (start date) and/or `"$lte"` (end date) in "YYYY-MM-DD" format.
 
     EXAMPLE:
-    User Query: "What is the sentiment of venkata satya in the Houston carpool whatsapp chat last month?"
+    User Query: "What is the sentiment of venkata satya in the Houston carpool whatsapp chat?"
     Your JSON:
     {{
       "semantic_query": "sentiment analysis",
       "metadata_filter": {{
         "sender": "venkat",
-        "source": "Hoston carpool whatsapp chat"
+        "source": "Houston carpool whatsapp"
+      }}
+    }}
+
+    User Query: "What is the sentiment of venkata satya in the Houston carpool whatsapp chat last month?"
+    Your JSON:
+    {{
+      "semantic_query": "sentiment analysis of venkata satya's messages",
+      "metadata_filter": {{
+        "sender": "venkata satya",
+        "source": "Houston carpool whatsapp",
+        "timestamp": {{
+          "$gte": "{ (datetime.now().replace(day=1) - timedelta(days=1)).replace(day=1).strftime('%Y-%m-%d') }",
+          "$lte": "{ (datetime.now().replace(day=1) - timedelta(days=1)).strftime('%Y-%m-%d') }"
+        }}
+      }}
+    }}
+
+    User Query: "Find emails from customer communications this week"
+    Your JSON:
+    {{
+      "semantic_query": "emails from customer communications",
+      "metadata_filter": {{
+        "from": "customer.communications",
+        "date": {{ "$gte": "{ (datetime.now() - timedelta(days=datetime.now().weekday())).strftime('%Y-%m-%d') }" }}
       }}
     }}
     """
@@ -78,6 +108,34 @@ def decompose_query_with_llm(client, user_query, metadata_keys):
     except Exception as e:
         print(f"\n[!] Could not decompose query. Falling back to simple search. Error: {e}")
         return {"semantic_query": user_query, "metadata_filter": {}}
+    
+# --- NEW: ROBUST DATE PARSING FUNCTION (THE FIX) ---
+def parse_flexible_date(date_string):
+    """
+    Tries multiple common date formats to parse a date string.
+    Returns a datetime object or None.
+    """
+    if not isinstance(date_string, str):
+        return None
+        
+    # List of formats to try, from most to least specific
+    formats_to_try = [
+        '%m/%d/%y, %H:%M',           # WhatsApp format: 6/18/24, 16:08
+        '%A, %d %B, %Y %I.%M %p',    # Email format: Monday, 10 March, 2025 11.27 AM
+        '%m/%d/%Y, %H:%M',          # WhatsApp format with 4-digit year
+        '%Y-%m-%dT%H:%M:%S',         # ISO format without timezone
+        '%Y-%m-%d',                 # Date only
+    ]
+    
+    for fmt in formats_to_try:
+        try:
+            # Strip any potential whitespace
+            return datetime.strptime(date_string.strip(), fmt)
+        except (ValueError, TypeError):
+            continue # Try the next format
+            
+    # If all formats fail, return None
+    return None
 
 # --- FUZZY METADATA FILTERING (THE DEFINITIVE FIX) ---
 def apply_fuzzy_filter_and_score(metadata_store, filter_dict):
@@ -88,23 +146,40 @@ def apply_fuzzy_filter_and_score(metadata_store, filter_dict):
     if not filter_dict:
         # If no filter, all documents are candidates with a neutral score
         return list(range(len(metadata_store)))
-
+    
     candidate_scores = []
     # Normalize filter values once
-    filter_values = {key: str(value).lower().split() for key, value in filter_dict.items()}
-
+    filter_values = {key: (str(value).lower().split() if key not in ['timestamp', 'date'] else value) for key, value in filter_dict.items()}
     for i, metadata in enumerate(metadata_store):
         score = 0
         match_count = 0
-        
         for key, query_parts in filter_values.items():
             metadata_value = metadata.get(key)
             if metadata_value is not None:
-                metadata_value_lower = str(metadata_value).lower()
-                # Check if all parts of the query value are in the metadata value
-                if all(part in metadata_value_lower for part in query_parts):
-                    score += 1 # Add 1 point for each matching key
-                    match_count += 1
+                # --- DATE FILTERING LOGIC (Using the robust parser) ---
+                if key in ['timestamp', 'date'] and isinstance(query_parts, dict):
+                    doc_date = parse_flexible_date(metadata_value)
+                    if doc_date:    
+                        try:
+                            if "$gte" in query_parts:
+                                start_date = datetime.strptime(query_parts["$gte"], '%Y-%m-%d')
+                                if doc_date < start_date:
+                                    match_count = 0
+                                    continue
+                            if "$lte" in query_parts:
+                                end_date = datetime.strptime(query_parts["$lte"], '%Y-%m-%d')
+                                # We only check the date part, ignore time for lte
+                                if doc_date.date() > end_date.date(): 
+                                    match_count = 0
+                                    continue
+                        except (ValueError, TypeError):
+                            continue # Skip if filter date is malformed
+                else:    
+                    metadata_value_lower = str(metadata_value).lower()
+                    # Check if all parts of the query value are in the metadata value
+                    if all(part in metadata_value_lower for part in query_parts):
+                        score += 1 # Add 1 point for each matching key
+                        match_count += 1
 
         # Only consider documents that matched at least one filter condition
         if match_count > 0:
@@ -115,6 +190,7 @@ def apply_fuzzy_filter_and_score(metadata_store, filter_dict):
     candidate_scores.sort(key=lambda x: x['score'], reverse=True)
     
     # Return the indices of the sorted candidates
+    # print(f"inside fuzzy filter and score, Found {len(candidate_scores)} candidates after fuzzy filtering.")
     return [item['index'] for item in candidate_scores]
 
 # --- ANSWER GENERATION ---
@@ -128,11 +204,11 @@ def get_answer_from_gpt(client, query, context):
     2.  Thoroughly analyze all the provided context chunks. Internally filter this context to find only the chunks that match the user's specific conditions.
     3.  Synthesize a single, concise, and accurate answer using ONLY the information found in the filtered context.
     4.  Cite the source file for every piece of information using the format [source: file_name].
-    5.  For sentiment analysis, focus on the overall tone and key phrases, while identifying and ignoring noise.
-    6.  If, after careful analysis, you cannot find the answer, you MUST state: "Based on the retrieved documents, I could not find a specific answer to your question."
+    5.  For sentiment analysis, focus on the overall tone and key phrases. Try to determine if the sentiment is positive, negative, or neutral based on the context.
+    6.  Only in cases where the context is completely irrelevant, answer with - "Based on the retrieved documents, I could not find a specific answer to your question.". Try to avoid this response unless absolutely necessary.
     """
     user_prompt = f"Retrieved Context:\n---\n{context}\n---\n\nUser's Original Question:\n{query}\n\nFinal Answer:"
-    
+    # print(f"\n[3] Asking gpt-4o for final answer to: \"{context}\"")
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
