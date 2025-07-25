@@ -1,10 +1,15 @@
 # .gitignore
 .env
 data/
+finetuned_bge_real_estate_model/
+checkpoints/
 credentials.json
 token.json
 metadata_store.pkl
 faiss_index.bin
+real_estate_finetuned_local_faiss.bin
+real_estate_finetuned_local_metadata.pkl
+real_estate_training_dataset.jsonl
 __pycache__/
 *.pyc
 
